@@ -24,16 +24,22 @@ from utils import (
     build_path_specific_adj,
     normalize_adj
 )
-from deeprobust.graph.data import Dataset
+try:
+    from deeprobust.graph.data import Dataset
+except ImportError:
+    Dataset = None
 from robcon import GCN_Contrastive
 from robcon import compute_graph_smoothness_loss
-# ==========================================
-# 1. 参数设置
-# ==========================================
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, default='cora',
-                    choices=['cora', 'lastfm', 'citeseer', 'twitch'], help='dataset')
+                    choices=['cora', 'lastfm', 'citeseer', 'twitch', 'blogcatalog', 'flickr',
+                             'amazon-ratings', 'roman-empire'], help='dataset')
 parser.add_argument('--ptb_rate', type=float, default=0.2, help='pertubation rate (noise level)')
+parser.add_argument('--noise_type', type=str, default='pair',
+                    choices=['pair', 'uniform', 'instance-dependent', 'instance_dependent', 'instance'],
+                    help='label noise type')
 
 # --- 多粒度阈值参数 ---
 parser.add_argument('--high_threshold', type=float, default=95,
@@ -45,7 +51,7 @@ parser.add_argument('--low_threshold', type=float, default=70,
 parser.add_argument('--eta', type=float, default=0.07884062447779473,
                     help='weight for student classification loss (low trust in coarse labels)')
 parser.add_argument('--beta', type=float, default=0.8368381709307913, help='weight for distillation loss (high trust in teacher)')
-parser.add_argument('--gamma', type=float, default=0.0002122386824213584, help='weight for label smoothing')
+parser.add_argument('--gamma', type=float, default=0.8, help='weight for label smoothing')
 parser.add_argument('--tau', type=float, default=1.4839917675184102, help='temperature for adjacency construction')
 parser.add_argument('--warmup', type=int, default=60, help='epochs for teacher warmup')
 
@@ -55,15 +61,67 @@ parser.add_argument('--alpha', type=float, default=0.3, help='parameter for adj 
 parser.add_argument("--log", action='store_true', help='enable logging')
 parser.add_argument('--attack', type=str, default='mettack', help='attack method')
 parser.add_argument("--label_rate", type=float, default=0.05, help='rate of labeled data')
+parser.add_argument('--val_rate', type=float, default=0.15,
+                    help='rate of validation data for datasets without public splits')
 parser.add_argument('--seed', type=int, default=11, help='Random seed')
 parser.add_argument('--n_hidden', type=int, default=64, help='hidden dimension')
 parser.add_argument('--epochs', type=int, default=300, help='training epochs')
 parser.add_argument('--lr', type=float, default=0.0015226896076809097, help='learning rate')
 parser.add_argument('--dropout', type=float, default=0.7909174068214975, help='dropout rate')  # 增加 dropout 防止过拟合
 parser.add_argument('--weight_decay', type=float, default=0.008759771994628095, help='weight_decay')
-
-
+parser.add_argument('--randomstate', type=int, default=10, help='The random seed')
+parser.add_argument('--no_tsne', action='store_true', help='skip t-SNE visualization')
 args = parser.parse_args()
+
+
+def apply_dataset_presets(args):
+    supplied = {
+        item[2:].replace('-', '_')
+        for item in sys.argv[1:]
+        if item.startswith('--')
+    }
+    presets = {
+        'blogcatalog': {
+            'high_threshold': 95,
+            'low_threshold': 70,
+            'eta': 1.0,
+            'beta': 0.1,
+            'gamma': 0.0,
+            'tau': 0.5,
+            'lr': 0.005,
+            'dropout': 0.3,
+            'weight_decay': 0.0001,
+        },
+        'flickr': {
+            'high_threshold': 99,
+            'low_threshold': 95,
+            'eta': 0.5,
+            'beta': 0.1,
+            'gamma': 0.0,
+            'tau': 0.2,
+            'lr': 0.003,
+            'dropout': 0.3,
+            'weight_decay': 0.0005,
+        },
+        'roman-empire': {
+            'high_threshold': 99,
+            'low_threshold': 90,
+            'eta': 0.5,
+            'beta': 0.1,
+            'gamma': 0.0,
+            'tau': 0.5,
+            'lr': 0.005,
+            'dropout': 0.3,
+            'weight_decay': 0.0001,
+        },
+    }
+
+    for key, value in presets.get(args.dataset.lower(), {}).items():
+        if key not in supplied:
+            setattr(args, key, value)
+
+
+apply_dataset_presets(args)
 
 if args.log:
     logger = get_logger(f'./log/{args.attack}/ours_warmup_{args.dataset}_{args.ptb_rate}.log')
@@ -104,7 +162,6 @@ if args.dataset == 'lastfm':
     idx = np.arange(n_nodes)
     np.random.shuffle(idx)
 
-    # 按照 训练 -> 验证 -> 测试 的顺序切分 (顺序不影响结果，只要互斥即可)
     idx_train = idx[:train_size]
     idx_val = idx[train_size: train_size + val_size]
     idx_test = idx[train_size + val_size:]
@@ -135,10 +192,76 @@ elif args.dataset == 'twitch':
     idx_test = idx[train_size + val_size:]
 
 else:
+    def split_by_percent(labels, train_percent=0.05, val_percent=0.15, seed=15):
+        n_nodes = len(labels)
+        train_size = int(n_nodes * train_percent)
+        val_size = int(n_nodes * val_percent)
+
+        rng = np.random.RandomState(seed)
+        idx = np.arange(n_nodes)
+        rng.shuffle(idx)
+
+        idx_train = idx[:train_size]
+        idx_val = idx[train_size: train_size + val_size]
+        idx_test = idx[train_size + val_size:]
+        return idx_train, idx_val, idx_test
+
+    def edge_index_to_csr(edge_index, num_nodes, make_undirected=True):
+        from torch_geometric.utils import remove_self_loops, to_undirected
+
+        edge_index, _ = remove_self_loops(edge_index)
+        if make_undirected:
+            edge_index = to_undirected(edge_index, num_nodes=num_nodes)
+
+        edge_index_np = edge_index.cpu().numpy()
+        values = np.ones(edge_index_np.shape[1], dtype=np.float32)
+        adj = sp.coo_matrix((values, (edge_index_np[0], edge_index_np[1])),
+                            shape=(num_nodes, num_nodes))
+        adj.data = np.ones_like(adj.data)
+        return adj.tocsr()
+
+    def tensor_to_numpy_features(x):
+        if getattr(x, "is_sparse", False) or getattr(x, "is_sparse_csr", False):
+            x = x.to_dense()
+        return x.cpu().numpy()
+
+    def load_noisygl_pyg_dataset(dataset_name, path='./data'):
+        """
+        Load NoisyGL-supported PyG datasets and convert them to the scipy/numpy
+        format used by the MSGNN training pipeline.
+        """
+        from torch_geometric.datasets import AttributedGraphDataset, HeterophilousGraphDataset
+
+        name_map = {
+            'blogcatalog': 'blogcatalog',
+            'flickr': 'flickr',
+            'amazon-ratings': 'Amazon-ratings',
+            'roman-empire': 'Roman-empire'
+        }
+        pyg_name = name_map[dataset_name.lower()]
+
+        if dataset_name.lower() in ['blogcatalog', 'flickr']:
+            dataset = AttributedGraphDataset(root=path, name=pyg_name)
+        else:
+            dataset = HeterophilousGraphDataset(root=path, name=pyg_name)
+
+        data = dataset[0]
+        features = tensor_to_numpy_features(data.x).astype(np.float32)
+        labels = data.y.cpu().numpy()
+        adj = edge_index_to_csr(data.edge_index, data.num_nodes, make_undirected=True)
+
+        idx_train, idx_val, idx_test = split_by_percent(
+            labels,
+            train_percent=args.label_rate,
+            val_percent=args.val_rate,
+            seed=args.seed
+        )
+        return adj, features, labels, idx_train, idx_val, idx_test
+
     def load_data_compatible(dataset_name='Cora', path='./data'):
         """
-        加载 Cora 数据集，并转换为 Scipy/Numpy 格式，以兼容 DeepRobust 风格的代码。
-        配置逻辑遵循 cora.yaml:
+        加载 Planetoid 数据集，并转换为 Scipy/Numpy 格式，以兼容 DeepRobust 风格的代码。
+        配置逻辑遵循 cora/citeseer:
         1. split='public' (标准划分)
         2. 无预处理归一化
         3. 无自环
@@ -167,23 +290,14 @@ else:
         idx_val = torch.nonzero(data.val_mask).squeeze().numpy()
         idx_test = torch.nonzero(data.test_mask).squeeze().numpy()
 
-        # 5. 构建 Scipy 稀疏邻接矩阵 (Tensor -> Scipy CSR Matrix)
-        # 对应 add_self_loop: false，直接使用原始边
-        edge_index = data.edge_index.numpy()
-        num_nodes = data.num_nodes
-
-        # 构建 COO 格式矩阵
-        # 值的权重设为 1.0
-        values = np.ones(edge_index.shape[1])
-        adj = sp.coo_matrix((values, (edge_index[0], edge_index[1])),
-                            shape=(num_nodes, num_nodes))
-
-        # 转换为 CSR 格式 (DeepRobust 和大多数 GCN 实现常用的格式)
-        adj = adj.tocsr()
+        adj = edge_index_to_csr(data.edge_index, data.num_nodes, make_undirected=False)
 
         return adj, features, labels, idx_train, idx_val, idx_test
 
-    adj, features, labels, idx_train, idx_val, idx_test = load_data_compatible(args.dataset)
+    if args.dataset in ['blogcatalog', 'flickr', 'amazon-ratings', 'roman-empire']:
+        adj, features, labels, idx_train, idx_val, idx_test = load_noisygl_pyg_dataset(args.dataset)
+    else:
+        adj, features, labels, idx_train, idx_val, idx_test = load_data_compatible(args.dataset)
 
 clean_labels = labels.copy()
 clean_labels = torch.LongTensor(clean_labels).to(device)
@@ -192,7 +306,8 @@ ptb = args.ptb_rate
 nclass = labels.max() + 1
 train_labels = labels[idx_train]
 # 添加噪声标签
-noise_y, P = noisify_with_P(train_labels, nclass, ptb, 10)
+noise_y, P = noisify_with_P(train_labels, nclass, ptb, args.randomstate,
+                            noise_type=args.noise_type, features=features[idx_train])
 noise_labels = labels.copy()
 noise_labels[idx_train] = noise_y
 labels = noise_labels
@@ -230,17 +345,21 @@ def tsne_plot(z, y, out_png="tsne_test.png", title="t-SNE", seed=42, perplexity=
     z2 = TSNE(
         n_components=2,
         init="pca",
-        learning_rate="auto",
+        learning_rate=200.0,
         perplexity=perp,
         random_state=seed,
     ).fit_transform(z)
 
+    plt.rcParams.update({'font.size': 14})
+
     plt.figure(figsize=(7, 6))
     sc = plt.scatter(z2[:, 0], z2[:, 1], c=y, s=8)
-    plt.title(f"{title} (perp={perp})")
+    # plt.title(f"{title} (perp={perp})")
+    plt.xticks([])
+    plt.yticks([])
     plt.colorbar(sc)
     plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
+    plt.savefig(out_png, dpi=300,bbox_inches='tight', pad_inches=0.05,)
     plt.close()
     print(f"[t-SNE] saved: {out_png}")
 
@@ -473,15 +592,18 @@ if __name__ == '__main__':
         z_vis = z_test[idx_test]  # (N_test, hidden)
         y_vis = clean_labels[idx_test]  # 用干净标签上色更直观
 
-        tsne_plot(
-            z_vis,
-            y_vis,
-            out_png=f"tsne_{args.dataset}_ptb{args.ptb_rate}_test.png",
-            title=f"{args.dataset} Student Embedding (test)",
-            seed=args.seed,
-            perplexity=30,
-            pca_dim=50
-        )
+
+        if not args.no_tsne:
+            tsne_plot(
+                z_vis,
+                y_vis,
+                out_png=f"tsne_{args.dataset}_ptb{args.ptb_rate}_test.pdf",
+                # title=f"{args.dataset} Student Embedding (test)",
+                seed=args.seed,
+                perplexity=30,
+                pca_dim=50
+            )
+
 
         logger.info(f"Test Accuracy: {acc_test:.4f}")
         print(f"Final_Experiment_Result: {acc_test:.4f}")

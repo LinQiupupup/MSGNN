@@ -77,7 +77,7 @@ def inject_noise_fast(adj, edge_rate, seed=42):
 # 使用方法
 # noisy_adj = inject_noise_fast(cut_adj, args.edge_rate)
 
-def noisify_with_P(y_train, nb_classes, noise, random_state=None, noise_type='pair'):
+def noisify_with_P(y_train, nb_classes, noise, random_state=None, noise_type='pair', features=None):
     if noise > 0.0:
         if noise_type == 'uniform':
             print('Uniform noise')
@@ -85,8 +85,12 @@ def noisify_with_P(y_train, nb_classes, noise, random_state=None, noise_type='pa
         elif noise_type == 'pair':
             print('Pair noise')
             P = build_pair_p(nb_classes, noise)
+        elif noise_type in ['instance', 'instance-dependent', 'instance_dependent']:
+            print('Instance-dependent noise')
+            y_train = noisify_instance_dependent(y_train, nb_classes, noise, random_state, features)
+            return y_train, None
         else:
-            print('Noise type have implemented')
+            raise ValueError(f'Unsupported noise_type: {noise_type}')
         # seed the random numbers with #run
         y_train_noisy = multiclass_noisify(y_train, P=P,
                                            random_state=random_state)
@@ -99,6 +103,49 @@ def noisify_with_P(y_train, nb_classes, noise, random_state=None, noise_type='pa
         P = np.eye(nb_classes)
 
     return y_train, P
+
+
+def noisify_instance_dependent(y, nb_classes, noise, random_state=0, features=None):
+    """Flip labels using per-instance class probabilities from feature prototypes."""
+    assert (noise >= 0.) and (noise <= 1.)
+    if features is None:
+        raise ValueError('features is required for instance-dependent noise')
+
+    y = np.asarray(y).copy()
+    x = features.toarray() if sp.issparse(features) else np.asarray(features)
+    x = x.astype(np.float64, copy=False)
+
+    prototypes = np.zeros((nb_classes, x.shape[1]), dtype=np.float64)
+    global_proto = x.mean(axis=0)
+    for cls in range(nb_classes):
+        cls_x = x[y == cls]
+        prototypes[cls] = cls_x.mean(axis=0) if cls_x.size else global_proto
+
+    x_norm = x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
+    proto_norm = prototypes / (np.linalg.norm(prototypes, axis=1, keepdims=True) + 1e-12)
+    scores = x_norm @ proto_norm.T
+    scores = scores - scores.max(axis=1, keepdims=True)
+    scores = np.exp(scores)
+    scores[np.arange(len(y)), y] = 0.0
+    row_sum = scores.sum(axis=1, keepdims=True)
+    scores = np.divide(scores, row_sum, out=np.zeros_like(scores), where=row_sum > 0)
+
+    flipper = np.random.RandomState(random_state)
+    new_y = y.copy()
+    for idx in np.arange(len(y)):
+        if flipper.rand() >= noise:
+            continue
+        probs = scores[idx]
+        if probs.sum() <= 0:
+            candidates = np.delete(np.arange(nb_classes), y[idx])
+            new_y[idx] = flipper.choice(candidates)
+        else:
+            new_y[idx] = flipper.choice(np.arange(nb_classes), p=probs)
+
+    actual_noise = (new_y != y).mean()
+    assert actual_noise > 0.0
+    print('Actual noise %.2f' % actual_noise)
+    return new_y
 
 
 def multiclass_noisify(y, P, random_state=0):

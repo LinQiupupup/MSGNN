@@ -3,8 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import scipy.sparse as sp
-from deeprobust.graph.utils import *
-from utils import sparse_dense_mul, to_tensor
+from utils import sparse_dense_mul, sparse_mx_to_torch_sparse_tensor, to_tensor
 
 class GCN_Contrastive(nn.Module):
     """
